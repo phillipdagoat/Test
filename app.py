@@ -3,232 +3,292 @@ import json
 import requests
 import psycopg
 
+from flask import Flask, jsonify
+
+
+# ============================================================
+# FLASK
+# ============================================================
+
+app = Flask(__name__)
+
 
 # ============================================================
 # SETTINGS
 # ============================================================
 
-AUCTION_API_URL = "https://gateway.pipeworx.io/us-auctions/mcp"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# This should already be set in Render as an environment variable.
-# Example:
-# DATABASE_URL=postgresql://user:password@host.neon.tech/dbname?sslmode=require
-DATABASE_URL = os.environ["DATABASE_URL"]
+AUCTION_API_URL = (
+    "https://gateway.pipeworx.io/v1/tools/us_auctions_search"
+)
+
+
+# This will store the result of the startup import
+STARTUP_RESULT = {
+    "status": "starting"
+}
 
 
 # ============================================================
-# GET ONE AUCTION LISTING
+# DATABASE
 # ============================================================
 
-def get_one_listing():
+def create_listings_table():
 
-    request_body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "us_auctions_search",
-            "arguments": {
-                "limit": 1
-            }
-        }
-    }
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is missing."
+        )
 
-    response = requests.post(
-        AUCTION_API_URL,
-        headers={
-            "Content-Type": "application/json"
-        },
-        json=request_body,
-        timeout=30
-    )
+    with psycopg.connect(DATABASE_URL) as conn:
 
-    response.raise_for_status()
+        with conn.cursor() as cur:
 
-    raw_response = response.json()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS listings (
 
-    # --------------------------------------------------------
-    # Pipeworx is an MCP endpoint, so the actual auction
-    # response may be inside result -> content -> text.
-    # --------------------------------------------------------
+                    id TEXT PRIMARY KEY,
 
-    data = raw_response
+                    listing_url TEXT,
 
-    if "result" in raw_response:
+                    auction_house TEXT,
 
-        content = raw_response["result"].get("content", [])
+                    title TEXT,
 
-        for block in content:
+                    description TEXT,
 
-            if block.get("type") == "text":
+                    category TEXT,
 
-                text = block.get("text", "")
+                    location TEXT,
 
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    pass
+                    state TEXT,
 
-                break
+                    end_time TEXT
 
-    # Find the first actual auction listing in the returned JSON
-    raw_listing = find_first_listing(data)
+                );
+            """)
 
-    if raw_listing is None:
-        print("Could not find an auction listing.")
-        print("\nRAW API RESPONSE:")
-        print(json.dumps(raw_response, indent=2))
+        conn.commit()
+
+    print("LISTINGS TABLE READY")
+
+
+# ============================================================
+# HELPER
+# ============================================================
+
+def first_value(data, *keys):
+
+    if not isinstance(data, dict):
         return None
 
-    # --------------------------------------------------------
-    # MAP API FIELDS TO OUR DATABASE FIELDS
-    # --------------------------------------------------------
-
-    listing = {
-        "listing_url": first_value(
-            raw_listing,
-            "listing_url",
-            "url",
-            "link",
-            "lot_url"
-        ),
-
-        "auction_house": first_value(
-            raw_listing,
-            "auction_house",
-            "selling_house",
-            "seller",
-            "house"
-        ),
-
-        "title": first_value(
-            raw_listing,
-            "title",
-            "name"
-        ),
-
-        "id": first_value(
-            raw_listing,
-            "id",
-            "listing_id",
-            "lot_id"
-        ),
-
-        "description": first_value(
-            raw_listing,
-            "description",
-            "lot_description",
-            "details"
-        ),
-
-        "category": first_value(
-            raw_listing,
-            "category",
-            "asset_type",
-            "type"
-        ),
-
-        "location": get_location(raw_listing),
-
-        "state": get_state(raw_listing),
-
-        "end_time": first_value(
-            raw_listing,
-            "end_time",
-            "close_time",
-            "closing_time",
-            "ends_at",
-            "auction_ends_at"
-        )
-    }
-
-    return listing
-
-
-# ============================================================
-# HELPERS FOR FIELD MAPPING
-# ============================================================
-
-def first_value(dictionary, *keys):
-    """
-    Look through several possible API field names
-    and return the first value found.
-    """
-
     for key in keys:
-        value = dictionary.get(key)
 
-        if value is not None:
-            # Some APIs return things such as:
-            # {"name": "Auction House"}
-            if isinstance(value, dict):
+        if key in data:
 
-                if value.get("name"):
-                    return str(value["name"])
+            value = data[key]
 
-                return json.dumps(value)
+            if value is not None:
 
-            return str(value)
+                if isinstance(value, dict):
+
+                    # Try common nested names first
+
+                    for nested_key in [
+                        "name",
+                        "title",
+                        "label",
+                        "value",
+                        "code"
+                    ]:
+
+                        if value.get(nested_key):
+                            return str(value[nested_key])
+
+                    return json.dumps(value)
+
+                if isinstance(value, list):
+                    return json.dumps(value)
+
+                return str(value)
 
     return None
 
 
-def get_location(listing):
+# ============================================================
+# FIND LISTING INSIDE API RESPONSE
+# ============================================================
 
-    value = listing.get("location")
+def find_listing(obj):
 
-    if value is None:
-        return first_value(
-            listing,
-            "location_name",
-            "city"
+    if isinstance(obj, dict):
+
+        keys = set(obj.keys())
+
+        # ----------------------------------------------------
+        # Looks like an auction listing
+        # ----------------------------------------------------
+
+        has_title = (
+            "title" in keys
+            or "name" in keys
         )
 
-    if isinstance(value, str):
-        return value
+        has_url = any(
+            key in keys
+            for key in [
+                "listing_url",
+                "url",
+                "link",
+                "lot_url",
+                "source_url"
+            ]
+        )
 
-    if isinstance(value, dict):
+        if has_title and has_url:
+            return obj
 
-        # Try a normal city/location name first
-        for key in ["name", "city", "raw", "location"]:
+        # ----------------------------------------------------
+        # Check common result containers first
+        # ----------------------------------------------------
 
-            item = value.get(key)
+        for key in [
+            "results",
+            "listings",
+            "lots",
+            "items",
+            "data",
+            "result"
+        ]:
 
-            if isinstance(item, str):
-                return item
+            if key in obj:
 
-            if isinstance(item, dict) and item.get("name"):
-                return item["name"]
+                found = find_listing(obj[key])
 
-        return json.dumps(value)
+                if found is not None:
+                    return found
 
-    return str(value)
+        # ----------------------------------------------------
+        # Search everything recursively
+        # ----------------------------------------------------
+
+        for value in obj.values():
+
+            found = find_listing(value)
+
+            if found is not None:
+                return found
 
 
-def get_state(listing):
+    elif isinstance(obj, list):
 
-    # State may exist directly
-    if listing.get("state"):
-        state = listing["state"]
+        for item in obj:
+
+            found = find_listing(item)
+
+            if found is not None:
+                return found
+
+    return None
+
+
+# ============================================================
+# LOCATION
+# ============================================================
+
+def extract_location(raw_listing):
+
+    location = raw_listing.get("location")
+
+    if isinstance(location, str):
+        return location
+
+    if isinstance(location, dict):
+
+        # Try full formatted value first
+
+        for key in [
+            "formatted",
+            "full",
+            "name",
+            "address"
+        ]:
+
+            if location.get(key):
+                return str(location[key])
+
+        # Build city/state if available
+
+        city = location.get("city")
+        state = location.get("state")
 
         if isinstance(state, dict):
+
+            state = (
+                state.get("code")
+                or state.get("name")
+            )
+
+        pieces = []
+
+        if city:
+            pieces.append(str(city))
+
+        if state:
+            pieces.append(str(state))
+
+        if pieces:
+            return ", ".join(pieces)
+
+        return json.dumps(location)
+
+    return first_value(
+        raw_listing,
+        "city",
+        "location_name"
+    )
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+def extract_state(raw_listing):
+
+    # --------------------------------------------------------
+    # State directly on listing
+    # --------------------------------------------------------
+
+    state = raw_listing.get("state")
+
+    if state:
+
+        if isinstance(state, dict):
+
             return (
                 state.get("code")
+                or state.get("abbreviation")
                 or state.get("name")
             )
 
         return str(state)
 
-    # Or it may be nested inside location
-    location = listing.get("location")
+    # --------------------------------------------------------
+    # State nested inside location
+    # --------------------------------------------------------
+
+    location = raw_listing.get("location")
 
     if isinstance(location, dict):
 
         state = location.get("state")
 
         if isinstance(state, dict):
+
             return (
                 state.get("code")
+                or state.get("abbreviation")
                 or state.get("name")
             )
 
@@ -238,124 +298,286 @@ def get_state(listing):
     return None
 
 
-def find_first_listing(obj):
-    """
-    Recursively search the API response until we find
-    what looks like an auction listing.
-    """
+# ============================================================
+# NORMALIZE LISTING
+# ============================================================
 
-    if isinstance(obj, dict):
+def normalize_listing(raw_listing):
 
-        # These are strong signals that this dictionary
-        # is an auction listing.
-        keys = set(obj.keys())
+    listing = {
 
-        if (
-            "title" in keys
-            and (
-                "listing_url" in keys
-                or "url" in keys
-                or "link" in keys
-                or "lot_url" in keys
-            )
-        ):
-            return obj
+        # ----------------------------------------------------
+        # URL
+        # ----------------------------------------------------
 
-        # Common containers returned by APIs
-        preferred_keys = [
-            "lots",
-            "listings",
-            "results",
-            "data",
-            "items"
-        ]
+        "listing_url": first_value(
+            raw_listing,
+            "listing_url",
+            "url",
+            "link",
+            "lot_url",
+            "source_url"
+        ),
 
-        for key in preferred_keys:
+        # ----------------------------------------------------
+        # AUCTION HOUSE
+        # ----------------------------------------------------
 
-            if key in obj:
+        "auction_house": first_value(
+            raw_listing,
+            "auction_house",
+            "selling_house",
+            "auctioneer",
+            "seller",
+            "house",
+            "source"
+        ),
 
-                result = find_first_listing(obj[key])
+        # ----------------------------------------------------
+        # TITLE
+        # ----------------------------------------------------
 
-                if result is not None:
-                    return result
+        "title": first_value(
+            raw_listing,
+            "title",
+            "name"
+        ),
 
-        # Search everything else
-        for value in obj.values():
+        # ----------------------------------------------------
+        # ID
+        # ----------------------------------------------------
 
-            result = find_first_listing(value)
+        "id": first_value(
+            raw_listing,
+            "id",
+            "listing_id",
+            "lot_id",
+            "item_id"
+        ),
 
-            if result is not None:
-                return result
+        # ----------------------------------------------------
+        # DESCRIPTION
+        # ----------------------------------------------------
 
-    elif isinstance(obj, list):
+        "description": first_value(
+            raw_listing,
+            "description",
+            "lot_description",
+            "details",
+            "summary"
+        ),
 
-        for item in obj:
+        # ----------------------------------------------------
+        # CATEGORY
+        # ----------------------------------------------------
 
-            result = find_first_listing(item)
+        "category": first_value(
+            raw_listing,
+            "category",
+            "asset_type",
+            "type"
+        ),
 
-            if result is not None:
-                return result
+        # ----------------------------------------------------
+        # LOCATION
+        # ----------------------------------------------------
 
-    return None
+        "location": extract_location(
+            raw_listing
+        ),
+
+        # ----------------------------------------------------
+        # STATE
+        # ----------------------------------------------------
+
+        "state": extract_state(
+            raw_listing
+        ),
+
+        # ----------------------------------------------------
+        # END TIME
+        # ----------------------------------------------------
+
+        "end_time": first_value(
+            raw_listing,
+            "end_time",
+            "close_time",
+            "closing_time",
+            "closes_at",
+            "ends_at",
+            "end_date"
+        )
+    }
+
+    return listing
 
 
 # ============================================================
-# PRINT THE LISTING
+# GET ONE ACTIVE AUCTION
+# ============================================================
+
+def get_one_active_listing():
+
+    print("")
+    print("CALLING AUCTION API...")
+    print("")
+
+    response = requests.post(
+        AUCTION_API_URL,
+
+        json={
+            "limit": 1
+        },
+
+        headers={
+            "Content-Type": "application/json"
+        },
+
+        timeout=30
+    )
+
+    print(
+        "AUCTION API STATUS:",
+        response.status_code
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    # --------------------------------------------------------
+    # PRINT RAW JSON
+    # --------------------------------------------------------
+
+    print("")
+    print("======================================")
+    print("RAW AUCTION API RESPONSE")
+    print("======================================")
+
+    print(
+        json.dumps(
+            data,
+            indent=2
+        )
+    )
+
+    print(
+        "======================================"
+    )
+
+    # --------------------------------------------------------
+    # FIND FIRST LISTING
+    # --------------------------------------------------------
+
+    raw_listing = find_listing(data)
+
+    if raw_listing is None:
+
+        raise RuntimeError(
+            "The API responded, but no listing could be found."
+        )
+
+    listing = normalize_listing(
+        raw_listing
+    )
+
+    # --------------------------------------------------------
+    # ID IS REQUIRED FOR DATABASE PRIMARY KEY
+    # --------------------------------------------------------
+
+    if not listing["id"]:
+
+        raise RuntimeError(
+            "Listing was found but API listing ID was missing."
+        )
+
+    return listing
+
+
+# ============================================================
+# PRINT LISTING
 # ============================================================
 
 def print_listing(listing):
 
-    print("\n====================================")
-    print("AUCTION LISTING")
-    print("====================================\n")
+    print("")
+    print("======================================")
+    print("NORMALIZED LISTING")
+    print("======================================")
+    print("")
 
-    print("listing_url:", listing["listing_url"])
-    print("auction_house:", listing["auction_house"])
-    print("title:", listing["title"])
-    print("id:", listing["id"])
-    print("description:", listing["description"])
-    print("category:", listing["category"])
-    print("location:", listing["location"])
-    print("state:", listing["state"])
-    print("end_time:", listing["end_time"])
+    print(
+        "listing_url:",
+        listing["listing_url"]
+    )
 
-    print("\n====================================\n")
+    print(
+        "auction_house:",
+        listing["auction_house"]
+    )
+
+    print(
+        "title:",
+        listing["title"]
+    )
+
+    print(
+        "id:",
+        listing["id"]
+    )
+
+    print(
+        "description:",
+        listing["description"]
+    )
+
+    print(
+        "category:",
+        listing["category"]
+    )
+
+    print(
+        "location:",
+        listing["location"]
+    )
+
+    print(
+        "state:",
+        listing["state"]
+    )
+
+    print(
+        "end_time:",
+        listing["end_time"]
+    )
+
+    print("")
+    print(
+        "======================================"
+    )
+    print("")
 
 
 # ============================================================
-# SAVE THE LISTING TO NEON
+# INSERT LISTING INTO NEON
 # ============================================================
 
-def save_to_neon(listing):
+def save_listing(listing):
 
-    with psycopg.connect(DATABASE_URL) as conn:
+    print(
+        "CONNECTING TO NEON..."
+    )
+
+    with psycopg.connect(
+        DATABASE_URL
+    ) as conn:
 
         with conn.cursor() as cur:
 
-            # -----------------------------------------------
-            # Create table
-            # -----------------------------------------------
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS listings (
-                    id TEXT PRIMARY KEY,
-                    listing_url TEXT,
-                    auction_house TEXT,
-                    title TEXT,
-                    description TEXT,
-                    category TEXT,
-                    location TEXT,
-                    state TEXT,
-                    end_time TEXT
-                );
-            """)
-
-            # -----------------------------------------------
-            # Insert exactly one listing
-            # -----------------------------------------------
-
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO listings (
+
                     listing_url,
                     auction_house,
                     title,
@@ -365,8 +587,11 @@ def save_to_neon(listing):
                     location,
                     state,
                     end_time
+
                 )
+
                 VALUES (
+
                     %s,
                     %s,
                     %s,
@@ -376,48 +601,213 @@ def save_to_neon(listing):
                     %s,
                     %s,
                     %s
+
                 )
 
                 ON CONFLICT (id)
+
                 DO UPDATE SET
 
-                    listing_url = EXCLUDED.listing_url,
-                    auction_house = EXCLUDED.auction_house,
-                    title = EXCLUDED.title,
-                    description = EXCLUDED.description,
-                    category = EXCLUDED.category,
-                    location = EXCLUDED.location,
-                    state = EXCLUDED.state,
-                    end_time = EXCLUDED.end_time;
-            """, (
+                    listing_url =
+                        EXCLUDED.listing_url,
 
-                listing["listing_url"],
-                listing["auction_house"],
-                listing["title"],
-                listing["id"],
-                listing["description"],
-                listing["category"],
-                listing["location"],
-                listing["state"],
-                listing["end_time"]
+                    auction_house =
+                        EXCLUDED.auction_house,
 
-            ))
+                    title =
+                        EXCLUDED.title,
+
+                    description =
+                        EXCLUDED.description,
+
+                    category =
+                        EXCLUDED.category,
+
+                    location =
+                        EXCLUDED.location,
+
+                    state =
+                        EXCLUDED.state,
+
+                    end_time =
+                        EXCLUDED.end_time;
+                """,
+
+                (
+
+                    listing["listing_url"],
+
+                    listing["auction_house"],
+
+                    listing["title"],
+
+                    listing["id"],
+
+                    listing["description"],
+
+                    listing["category"],
+
+                    listing["location"],
+
+                    listing["state"],
+
+                    listing["end_time"]
+
+                )
+            )
 
         conn.commit()
 
-    print("Listing successfully saved to Neon.")
+    print("")
+    print(
+        "SUCCESSFULLY SAVED LISTING TO NEON"
+    )
+    print("")
 
 
 # ============================================================
-# RUN PROGRAM
+# IMPORT ONE LISTING
+# ============================================================
+
+def import_one_listing():
+
+    create_listings_table()
+
+    listing = get_one_active_listing()
+
+    print_listing(
+        listing
+    )
+
+    save_listing(
+        listing
+    )
+
+    return listing
+
+
+# ============================================================
+# FLASK HOME PAGE
+# ============================================================
+
+@app.route("/")
+def home():
+
+    return jsonify({
+
+        "message":
+            "Auction API + Neon application is running.",
+
+        "startup_result":
+            STARTUP_RESULT,
+
+        "import_endpoint":
+            "/import-one"
+
+    })
+
+
+# ============================================================
+# MANUALLY IMPORT ONE ACTIVE LISTING
+# ============================================================
+
+@app.route("/import-one")
+def import_one():
+
+    try:
+
+        listing = import_one_listing()
+
+        return jsonify({
+
+            "success": True,
+
+            "message":
+                "One active auction listing was saved to Neon.",
+
+            "listing":
+                listing
+
+        })
+
+    except Exception as error:
+
+        print(
+            "IMPORT ERROR:",
+            str(error)
+        )
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+                str(error)
+
+        }), 500
+
+
+# ============================================================
+# STARTUP IMPORT
+# ============================================================
+
+try:
+
+    listing = import_one_listing()
+
+    STARTUP_RESULT = {
+
+        "success": True,
+
+        "message":
+            "One active listing was imported during startup.",
+
+        "listing":
+            listing
+
+    }
+
+except Exception as error:
+
+    print("")
+    print(
+        "STARTUP IMPORT FAILED:"
+    )
+
+    print(
+        str(error)
+    )
+
+    print("")
+
+    # IMPORTANT:
+    # We do not crash Flask if the auction API
+    # or database temporarily fails.
+
+    STARTUP_RESULT = {
+
+        "success": False,
+
+        "error":
+            str(error)
+
+    }
+
+
+# ============================================================
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
 
-    listing = get_one_listing()
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
 
-    if listing:
-
-        print_listing(listing)
-
-        save_to_neon(listing)
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
