@@ -469,26 +469,26 @@ if __name__ == "__main__":
 # IMPORT ONE LISTING WHEN RENDER STARTS
 # ============================================================
 
-try:
-    print("STARTING AUTOMATIC GSA IMPORT...")
+    try:
+        print("STARTING AUTOMATIC GSA IMPORT...")
+    
+        new_id, listing = import_one_listing()
+    
+        print("")
+        print("=====================================")
+        print("AUTOMATIC IMPORT SUCCESSFUL")
+        print(f"NEW DATABASE ROW ID: {new_id}")
+        print("=====================================")
+        print("")
 
-    new_id, listing = import_one_listing()
+    except Exception as error:
 
-    print("")
-    print("=====================================")
-    print("AUTOMATIC IMPORT SUCCESSFUL")
-    print(f"NEW DATABASE ROW ID: {new_id}")
-    print("=====================================")
-    print("")
-
-except Exception as error:
-
-    print("")
-    print("=====================================")
-    print("AUTOMATIC IMPORT FAILED")
-    print(str(error))
-    print("=====================================")
-    print("")
+        print("")
+        print("=====================================")
+        print("AUTOMATIC IMPORT FAILED")
+        print(str(error))
+        print("=====================================")
+        print("")
     port = int(
         os.environ.get(
             "PORT",
