@@ -417,7 +417,6 @@ def insert_listing(listing):
 
             cur.execute("""
                 INSERT INTO active_listings (
-
                     start_time,
                     end_time,
                     title,
@@ -432,29 +431,13 @@ def insert_listing(listing):
                     reserve,
                     bid_increment,
                     photo_url
-
                 )
-
                 VALUES (
-
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s
-
-                );
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s
+                )
+                RETURNING *;
             """, (
-
                 listing["start_time"],
                 listing["end_time"],
                 listing["title"],
@@ -469,51 +452,73 @@ def insert_listing(listing):
                 listing["reserve"],
                 listing["bid_increment"],
                 listing["photo_url"]
-
             ))
+
+            inserted_row = cur.fetchone()
+
+            column_names = [
+                description.name
+                for description in cur.description
+            ]
 
         conn.commit()
 
-    print("")
-    print("SUCCESS")
-    print("ROW INSERTED INTO active_listings")
-    print("")
+    inserted = dict(
+        zip(column_names, inserted_row)
+    )
 
+    print("INSERTED INTO active_listings:")
+    print(inserted)
 
-# ============================================================
+    return inserted
+    # ============================================================
 # COMPLETE IMPORT
 # ============================================================
 
-def import_one_listing():
+@app.route("/import-one")
+def import_one():
 
-    # Confirm Neon works
-    check_database()
+    try:
 
-    # Confirm correct table exists
-    check_active_listings_table()
+        raw_listing = get_one_gsa_listing()
 
-    # Pull one active listing
-    raw_listing = get_one_gsa_listing()
+        listing = map_gsa_listing(
+            raw_listing
+        )
 
-    # Map GSA → your database fields
-    listing = map_gsa_listing(
-        raw_listing
-    )
+        print("GSA LISTING:")
+        print(listing)
 
-    # Print everything to Render logs
-    print_listing(
-        listing
-    )
+        inserted = insert_listing(
+            listing
+        )
 
-    # Create the row
-    insert_listing(
-        listing
-    )
+        # Convert values to strings if Flask can't JSON encode them
+        result = {}
 
-    return listing
+        for key, value in inserted.items():
 
+            if value is None:
+                result[key] = None
 
-# ============================================================
+            else:
+                result[key] = str(value)
+
+        return jsonify({
+            "success": True,
+            "message": "ROW INSERTED INTO active_listings",
+            "inserted_row": result
+        })
+
+    except Exception as error:
+
+        print("IMPORT ERROR:", repr(error))
+
+        return jsonify({
+            "success": False,
+            "error": str(error)
+        }), 500
+        # ============================================================
 # HOME PAGE
 # ============================================================
 
