@@ -415,6 +415,64 @@ def import_one():
 # LOCAL RUN
 # ============================================================
 
+@app.route("/test-insert")
+def test_insert():
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+
+                cur.execute("""
+                    INSERT INTO listings (
+                        start_time,
+                        end_time,
+                        title,
+                        address,
+                        city,
+                        state,
+                        zip_code,
+                        description,
+                        seller_name,
+                        seller_email,
+                        seller_phone,
+                        reserve,
+                        bid_increment,
+                        photo_url
+                    )
+                    VALUES (
+                        '2026-10-01',
+                        '2026-10-10',
+                        'TEST AUCTION ITEM',
+                        '123 TEST STREET',
+                        'Los Angeles',
+                        'CA',
+                        '90001',
+                        'This is a test listing.',
+                        'Test Seller',
+                        'test@example.com',
+                        '555-555-5555',
+                        100.00,
+                        10.00,
+                        'https://example.com/photo.jpg'
+                    )
+                    RETURNING id;
+                """)
+
+                new_id = cur.fetchone()[0]
+
+            conn.commit()
+
+        return {
+            "success": True,
+            "message": "TEST ROW INSERTED",
+            "id": new_id
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }, 500
+
 if __name__ == "__main__":
     # ============================================================
 # IMPORT ONE LISTING WHEN RENDER STARTS
