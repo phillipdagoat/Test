@@ -545,56 +545,6 @@ def home():
 # IMPORT ONE LISTING
 # ============================================================
 
-@app.route("/import-one")
-def import_one():
-
-    try:
-
-        listing = import_one_listing()
-
-        # Decimal cannot automatically be JSON encoded
-        response_listing = {}
-
-        for key, value in listing.items():
-
-            if isinstance(value, Decimal):
-
-                response_listing[key] = str(value)
-
-            else:
-
-                response_listing[key] = value
-
-        return jsonify({
-
-            "success": True,
-
-            "message":
-                "One GSA listing was inserted into active_listings.",
-
-            "listing":
-                response_listing
-
-        })
-
-    except Exception as error:
-
-        print("")
-        print("========================================")
-        print("IMPORT ERROR")
-        print(repr(error))
-        print("========================================")
-        print("")
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                str(error)
-
-        }), 500
-
 
 # ============================================================
 # COUNT ROWS
