@@ -275,88 +275,47 @@ def print_listing(listing):
 
 def insert_listing(listing):
 
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing.")
-
     with psycopg.connect(DATABASE_URL) as conn:
 
         with conn.cursor() as cur:
 
             cur.execute("""
                 INSERT INTO listings (
-
                     start_time,
                     end_time,
-
                     title,
-
                     address,
                     city,
                     state,
                     zip_code,
-
                     description,
-
                     seller_name,
                     seller_email,
                     seller_phone,
-
                     reserve,
                     bid_increment,
-
                     photo_url
-
                 )
-
                 VALUES (
-
-                    %s,
-                    %s,
-
-                    %s,
-
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-
-                    %s,
-
-                    %s,
-                    %s,
-                    %s,
-
-                    %s,
-                    %s,
-
-                    %s
-
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s
                 )
-
                 RETURNING id;
             """, (
-
                 listing["start_time"],
                 listing["end_time"],
-
                 listing["title"],
-
                 listing["address"],
                 listing["city"],
                 listing["state"],
                 listing["zip_code"],
-
                 listing["description"],
-
                 listing["seller_name"],
                 listing["seller_email"],
                 listing["seller_phone"],
-
                 listing["reserve"],
                 listing["bid_increment"],
-
                 listing["photo_url"]
-
             ))
 
             new_id = cur.fetchone()[0]
@@ -364,8 +323,6 @@ def insert_listing(listing):
         conn.commit()
 
     return new_id
-
-
 # ============================================================
 # COMPLETE IMPORT
 # ============================================================
@@ -425,42 +382,36 @@ def home():
 # ============================================================
 
 @app.route("/import-one")
+@app.route("/import-one")
 def import_one():
-
     try:
+        create_table()
 
-        new_id, listing = import_one_listing()
+        raw_listing = get_one_listing()
+
+        listing = map_listing(raw_listing)
+
+        print("ABOUT TO INSERT:")
+        print(listing)
+
+        new_id = insert_listing(listing)
+
+        print(f"ROW CREATED IN NEON WITH ID: {new_id}")
 
         return jsonify({
-
             "success": True,
-
-            "database_id":
-                new_id,
-
-            "listing":
-                listing
-
+            "database_id": new_id,
+            "listing": listing
         })
 
     except Exception as error:
-
-        print(
-            "ERROR:",
-            str(error)
-        )
+        print("IMPORT ERROR:", str(error))
 
         return jsonify({
-
             "success": False,
-
-            "error":
-                str(error)
-
+            "error": str(error)
         }), 500
-
-
-# ============================================================
+        # ============================================================
 # LOCAL RUN
 # ============================================================
 
