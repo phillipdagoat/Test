@@ -149,28 +149,83 @@ def looks_like_gsa_listing(obj):
     )
 
 
-def find_one_active_listing(obj):
+def parse_gsa_date(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    # GSA documents these as date strings. Try the common forms
+    # without crashing if the live feed varies slightly.
+    from datetime import datetime
+
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text[:10], fmt).date()
+        except ValueError:
+            pass
+
+    return None
+
+
+def collect_gsa_listings(obj, found=None):
+    if found is None:
+        found = []
+
     if isinstance(obj, dict):
         if looks_like_gsa_listing(obj):
-            status = str(obj.get("AuctionStatus", "")).strip().upper()
-
-            if status == "A":
-                return obj
+            found.append(obj)
 
         for value in obj.values():
-            found = find_one_active_listing(value)
-
-            if found is not None:
-                return found
+            collect_gsa_listings(value, found)
 
     elif isinstance(obj, list):
         for item in obj:
-            found = find_one_active_listing(item)
+            collect_gsa_listings(item, found)
 
-            if found is not None:
-                return found
+    return found
 
-    return None
+
+def find_one_active_listing(data):
+    from datetime import date
+
+    listings = collect_gsa_listings(data)
+
+    if not listings:
+        return None
+
+    # 1. Prefer an explicit status supplied by GSA.
+    for listing in listings:
+        status = str(
+            listing.get("AuctionStatus", "")
+        ).strip().upper()
+
+        if status in {"A", "ACTIVE"}:
+            return listing
+
+    # 2. Some live responses may omit/populate AuctionStatus differently.
+    #    In that case, use start/end dates to find a currently running lot.
+    today = date.today()
+
+    for listing in listings:
+        start_date = parse_gsa_date(
+            listing.get("AucStartDt")
+        )
+        end_date = parse_gsa_date(
+            listing.get("AucEndDt")
+        )
+
+        if start_date and end_date:
+            if start_date <= today <= end_date:
+                return listing
+
+    # 3. Last resort: the GSA endpoint is a live-auctions feed, so return
+    #    the first recognizable listing instead of failing solely because
+    #    AuctionStatus was absent from the payload.
+    return listings[0]
 
 
 def get_one_gsa_listing():
@@ -207,7 +262,7 @@ def get_one_gsa_listing():
 
     if listing is None:
         raise RuntimeError(
-            "The GSA response contained no listing with AuctionStatus='A'."
+            "The GSA response contained no recognizable auction listing."
         )
 
     return listing
