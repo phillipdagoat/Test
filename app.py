@@ -3,419 +3,244 @@ from decimal import Decimal, InvalidOperation
 
 import requests
 import psycopg
+from psycopg.rows import dict_row
 from flask import Flask, jsonify
 
-
-# ============================================================
-# FLASK
-# ============================================================
-
 app = Flask(__name__)
-
-
-# ============================================================
-# ENVIRONMENT VARIABLES
-# ============================================================
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GSA_API_KEY = os.environ.get("GSA_API_KEY")
 
-
-# ============================================================
-# GSA AUCTIONS API
-# ============================================================
-
 GSA_API_URL = "https://api.gsa.gov/assets/gsaauctions/v2/auctions"
+TABLE_NAME = "active_listings"
 
+EXPECTED_COLUMNS = [
+    "start_time",
+    "end_time",
+    "title",
+    "address",
+    "city",
+    "state",
+    "zip_code",
+    "description",
+    "seller_name",
+    "seller_email",
+    "seller_phone",
+    "reserve",
+    "bid_increment",
+    "photo_url",
+]
 
-# ============================================================
-# NUMBER CLEANER
-# ============================================================
 
 def clean_number(value):
-
     if value is None:
         return None
 
     text = str(value).strip()
 
-    if text == "":
+    if not text:
         return None
 
-    text = (
-        text
-        .replace("$", "")
-        .replace(",", "")
-    )
+    text = text.replace("$", "").replace(",", "")
 
     try:
         return Decimal(text)
-
     except (InvalidOperation, ValueError):
         return None
 
 
-# ============================================================
-# ZIP CODE CLEANER
-# ============================================================
-
 def clean_zip(value):
-
     if value is None:
         return None
 
-    value = str(value).strip()
+    text = str(value).strip()
 
-    if value == "":
+    if not text:
         return None
 
-    # Preserve 5-digit ZIP format
-    if value.isdigit() and len(value) < 5:
-        value = value.zfill(5)
+    if text.isdigit() and len(text) < 5:
+        text = text.zfill(5)
 
-    return value
+    return text
 
 
-# ============================================================
-# CHECK DATABASE CONNECTION
-# ============================================================
-
-def check_database():
-
+def require_database_url():
     if not DATABASE_URL:
         raise RuntimeError(
-            "DATABASE_URL is missing from Render."
+            "DATABASE_URL is missing from Render Environment Variables."
         )
 
-    with psycopg.connect(DATABASE_URL) as conn:
 
-        with conn.cursor() as cur:
+def get_table_schema(conn):
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            '''
+            SELECT
+                column_name,
+                data_type,
+                is_nullable,
+                column_default,
+                is_identity
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            ORDER BY ordinal_position;
+            ''',
+            (TABLE_NAME,),
+        )
 
-            cur.execute("""
-                SELECT current_database();
-            """)
+        return cur.fetchall()
 
-            database_name = cur.fetchone()[0]
 
-    print(
-        "CONNECTED TO NEON DATABASE:",
-        database_name
+def validate_active_listings_table(conn):
+    schema = get_table_schema(conn)
+
+    if not schema:
+        raise RuntimeError(
+            "Table 'active_listings' was not found in the public schema "
+            "of the Neon database Render is connected to."
+        )
+
+    existing_columns = {row["column_name"] for row in schema}
+
+    missing = [
+        column
+        for column in EXPECTED_COLUMNS
+        if column not in existing_columns
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "active_listings is missing these required columns: "
+            + ", ".join(missing)
+        )
+
+    extra_required = []
+
+    for row in schema:
+        column = row["column_name"]
+
+        if column in EXPECTED_COLUMNS:
+            continue
+
+        nullable = row["is_nullable"] == "YES"
+        has_default = row["column_default"] is not None
+        is_identity = row["is_identity"] == "YES"
+
+        if not nullable and not has_default and not is_identity:
+            extra_required.append(column)
+
+    if extra_required:
+        raise RuntimeError(
+            "active_listings has additional NOT NULL columns with no default: "
+            + ", ".join(extra_required)
+            + ". Those columns must either get a default/identity value "
+              "or be added to the importer."
+        )
+
+    return schema
+
+
+def looks_like_gsa_listing(obj):
+    return (
+        isinstance(obj, dict)
+        and "ItemName" in obj
+        and ("SaleNo" in obj or "LotNo" in obj)
     )
 
 
-# ============================================================
-# CHECK ACTIVE_LISTINGS TABLE EXISTS
-# ============================================================
+def find_one_active_listing(obj):
+    if isinstance(obj, dict):
+        if looks_like_gsa_listing(obj):
+            status = str(obj.get("AuctionStatus", "")).strip().upper()
 
-def check_active_listings_table():
+            if status == "A":
+                return obj
 
-    with psycopg.connect(DATABASE_URL) as conn:
+        for value in obj.values():
+            found = find_one_active_listing(value)
 
-        with conn.cursor() as cur:
+            if found is not None:
+                return found
 
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_schema = 'public'
-                    AND table_name = 'active_listings'
-                );
-            """)
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_one_active_listing(item)
 
-            exists = cur.fetchone()[0]
+            if found is not None:
+                return found
 
-    if not exists:
+    return None
 
-        raise RuntimeError(
-            "The active_listings table does not exist in Neon."
-        )
-
-    print("active_listings table found.")
-
-
-# ============================================================
-# FIND ONE ACTIVE GSA LISTING
-# ============================================================
-
-def find_active_listing(data):
-
-    active_listing = None
-    fallback_listing = None
-
-    def search(obj):
-
-        nonlocal active_listing
-        nonlocal fallback_listing
-
-        if active_listing is not None:
-            return
-
-        # ----------------------------------------------------
-        # DICTIONARY
-        # ----------------------------------------------------
-
-        if isinstance(obj, dict):
-
-            looks_like_listing = (
-                "ItemName" in obj
-                or "SaleNo" in obj
-                or "LotNo" in obj
-            )
-
-            if looks_like_listing:
-
-                if fallback_listing is None:
-                    fallback_listing = obj
-
-                status = str(
-                    obj.get(
-                        "AuctionStatus",
-                        ""
-                    )
-                ).strip().upper()
-
-                if status == "A":
-
-                    active_listing = obj
-
-                    return
-
-            for value in obj.values():
-
-                search(value)
-
-                if active_listing is not None:
-                    return
-
-        # ----------------------------------------------------
-        # LIST
-        # ----------------------------------------------------
-
-        elif isinstance(obj, list):
-
-            for item in obj:
-
-                search(item)
-
-                if active_listing is not None:
-                    return
-
-    search(data)
-
-    if active_listing is not None:
-        return active_listing
-
-    return fallback_listing
-
-
-# ============================================================
-# CALL GSA API
-# ============================================================
 
 def get_one_gsa_listing():
-
     if not GSA_API_KEY:
-
         raise RuntimeError(
-            "GSA_API_KEY is missing from Render."
+            "GSA_API_KEY is missing from Render Environment Variables."
         )
 
-    print("")
-    print("Calling GSA Auctions API...")
-    print("")
+    print("Calling GSA Auctions API...", flush=True)
 
     response = requests.get(
         GSA_API_URL,
         params={
             "api_key": GSA_API_KEY,
-            "format": "JSON"
+            "format": "JSON",
         },
-        timeout=60
+        timeout=60,
+        allow_redirects=True,
     )
 
-    print(
-        "GSA HTTP STATUS:",
-        response.status_code
-    )
+    print("GSA status:", response.status_code, flush=True)
+    print("GSA final URL:", response.url, flush=True)
 
     response.raise_for_status()
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            "GSA responded, but the response was not valid JSON."
+        ) from exc
 
-    listing = find_active_listing(data)
+    listing = find_one_active_listing(data)
 
     if listing is None:
-
         raise RuntimeError(
-            "No active GSA listing was found."
+            "The GSA response contained no listing with AuctionStatus='A'."
         )
-
-    print("Active GSA listing found.")
 
     return listing
 
-
-# ============================================================
-# MAP GSA FIELDS TO ACTIVE_LISTINGS
-# ============================================================
 
 def map_gsa_listing(gsa):
-
-    listing = {
-
-        # ----------------------------------------
-        # AucStartDt → start_time
-        # ----------------------------------------
-
-        "start_time":
-            gsa.get("AucStartDt"),
-
-
-        # ----------------------------------------
-        # AucEndDt → end_time
-        # ----------------------------------------
-
-        "end_time":
-            gsa.get("AucEndDt"),
-
-
-        # ----------------------------------------
-        # ItemName → title
-        # ----------------------------------------
-
-        "title":
-            gsa.get("ItemName"),
-
-
-        # ----------------------------------------
-        # PropertyAddr3 → address
-        # ----------------------------------------
-
-        "address":
-            gsa.get("PropertyAddr3"),
-
-
-        # ----------------------------------------
-        # PropertyCity → city
-        # ----------------------------------------
-
-        "city":
-            gsa.get("PropertyCity"),
-
-
-        # ----------------------------------------
-        # PropertyState → state
-        # ----------------------------------------
-
-        "state":
-            gsa.get("PropertyState"),
-
-
-        # ----------------------------------------
-        # PropertyZip → zip_code
-        # ----------------------------------------
-
-        "zip_code":
-            clean_zip(
-                gsa.get("PropertyZip")
-            ),
-
-
-        # ----------------------------------------
-        # LotDescript → description
-        # ----------------------------------------
-
-        "description":
-            gsa.get("LotDescript"),
-
-
-        # ----------------------------------------
-        # ContractOfficer → seller_name
-        # ----------------------------------------
-
-        "seller_name":
-            gsa.get("ContractOfficer"),
-
-
-        # ----------------------------------------
-        # COEmail → seller_email
-        # ----------------------------------------
-
-        "seller_email":
-            gsa.get("COEmail"),
-
-
-        # ----------------------------------------
-        # COPhone → seller_phone
-        # ----------------------------------------
-
-        "seller_phone":
-            gsa.get("COPhone"),
-
-
-        # ----------------------------------------
-        # Reserve → reserve
-        # ----------------------------------------
-
-        "reserve":
-            clean_number(
-                gsa.get("Reserve")
-            ),
-
-
-        # ----------------------------------------
-        # AucIncrement → bid_increment
-        # ----------------------------------------
-
-        "bid_increment":
-            clean_number(
-                gsa.get("AucIncrement")
-            ),
-
-
-        # ----------------------------------------
-        # ImageURL → photo_url
-        # ----------------------------------------
-
-        "photo_url":
-            gsa.get("ImageURL")
+    return {
+        "start_time": gsa.get("AucStartDt"),
+        "end_time": gsa.get("AucEndDt"),
+        "title": gsa.get("ItemName"),
+        "address": gsa.get("PropertyAddr3"),
+        "city": gsa.get("PropertyCity"),
+        "state": gsa.get("PropertyState"),
+        "zip_code": clean_zip(gsa.get("PropertyZip")),
+        "description": gsa.get("LotDescript"),
+        "seller_name": gsa.get("ContractOfficer"),
+        "seller_email": gsa.get("COEmail"),
+        "seller_phone": gsa.get("COPhone"),
+        "reserve": clean_number(gsa.get("Reserve")),
+        "bid_increment": clean_number(gsa.get("AucIncrement")),
+        "photo_url": gsa.get("ImageURL"),
     }
 
-    return listing
-
-
-# ============================================================
-# PRINT VALUES
-# ============================================================
-
-def print_listing(listing):
-
-    print("")
-    print("========================================")
-    print("GSA LISTING → ACTIVE_LISTINGS")
-    print("========================================")
-
-    for key, value in listing.items():
-
-        print(
-            f"{key}: {value}"
-        )
-
-    print("========================================")
-    print("")
-
-
-# ============================================================
-# INSERT INTO active_listings
-# ============================================================
 
 def insert_listing(listing):
+    require_database_url()
 
     with psycopg.connect(DATABASE_URL) as conn:
+        validate_active_listings_table(conn)
 
-        with conn.cursor() as cur:
-
-            cur.execute("""
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                '''
                 INSERT INTO active_listings (
                     start_time,
                     end_time,
@@ -433,246 +258,162 @@ def insert_listing(listing):
                     photo_url
                 )
                 VALUES (
-                    %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s
+                    %(start_time)s,
+                    %(end_time)s,
+                    %(title)s,
+                    %(address)s,
+                    %(city)s,
+                    %(state)s,
+                    %(zip_code)s,
+                    %(description)s,
+                    %(seller_name)s,
+                    %(seller_email)s,
+                    %(seller_phone)s,
+                    %(reserve)s,
+                    %(bid_increment)s,
+                    %(photo_url)s
                 )
                 RETURNING *;
-            """, (
-                listing["start_time"],
-                listing["end_time"],
-                listing["title"],
-                listing["address"],
-                listing["city"],
-                listing["state"],
-                listing["zip_code"],
-                listing["description"],
-                listing["seller_name"],
-                listing["seller_email"],
-                listing["seller_phone"],
-                listing["reserve"],
-                listing["bid_increment"],
-                listing["photo_url"]
-            ))
+                ''',
+                listing,
+            )
 
             inserted_row = cur.fetchone()
 
-            column_names = [
-                description.name
-                for description in cur.description
-            ]
-
         conn.commit()
 
-    inserted = dict(
-        zip(column_names, inserted_row)
-    )
-
-    print("INSERTED INTO active_listings:")
-    print(inserted)
-
-    return inserted
-    # ============================================================
-# COMPLETE IMPORT
-# ============================================================
-
-@app.route("/import-one")
-def import_one():
-
-    try:
-
-        raw_listing = get_one_gsa_listing()
-
-        listing = map_gsa_listing(
-            raw_listing
+    if inserted_row is None:
+        raise RuntimeError(
+            "PostgreSQL did not return the inserted active_listings row."
         )
 
-        print("GSA LISTING:")
-        print(listing)
+    return dict(inserted_row)
 
-        inserted = insert_listing(
-            listing
-        )
 
-        # Convert values to strings if Flask can't JSON encode them
-        result = {}
+def json_safe(row):
+    safe = {}
 
-        for key, value in inserted.items():
+    for key, value in row.items():
+        if isinstance(value, Decimal):
+            safe[key] = str(value)
+        elif value is None:
+            safe[key] = None
+        else:
+            safe[key] = str(value)
 
-            if value is None:
-                result[key] = None
+    return safe
 
-            else:
-                result[key] = str(value)
-
-        return jsonify({
-            "success": True,
-            "message": "ROW INSERTED INTO active_listings",
-            "inserted_row": result
-        })
-
-    except Exception as error:
-
-        print("IMPORT ERROR:", repr(error))
-
-        return jsonify({
-            "success": False,
-            "error": str(error)
-        }), 500
-        # ============================================================
-# HOME PAGE
-# ============================================================
 
 @app.route("/")
 def home():
-
-    return jsonify({
-
-        "success": True,
-
-        "message":
-            "GSA Auctions importer is running.",
-
-        "database_table":
-            "active_listings",
-
-        "import_endpoint":
-            "/import-one"
-
-    })
+    return jsonify(
+        {
+            "success": True,
+            "message": "GSA -> Neon importer is running.",
+            "table": TABLE_NAME,
+            "import_one": "/import-one",
+            "schema_check": "/schema",
+            "count": "/count",
+        }
+    )
 
 
-# ============================================================
-# IMPORT ONE LISTING
-# ============================================================
+@app.route("/schema")
+def schema():
+    try:
+        require_database_url()
+
+        with psycopg.connect(DATABASE_URL) as conn:
+            table_schema = get_table_schema(conn)
+
+        return jsonify(
+            {
+                "success": True,
+                "table": TABLE_NAME,
+                "columns": table_schema,
+            }
+        )
+
+    except Exception as error:
+        print("SCHEMA ERROR:", repr(error), flush=True)
+
+        return jsonify(
+            {
+                "success": False,
+                "error": str(error),
+            }
+        ), 500
 
 
-# ============================================================
-# COUNT ROWS
-# ============================================================
+@app.route("/import-one")
+def import_one():
+    try:
+        print("Starting one-listing import...", flush=True)
+
+        raw_listing = get_one_gsa_listing()
+        mapped_listing = map_gsa_listing(raw_listing)
+
+        print("Mapped listing:", mapped_listing, flush=True)
+
+        inserted_row = insert_listing(mapped_listing)
+
+        print("INSERT SUCCESS:", inserted_row, flush=True)
+
+        return jsonify(
+            {
+                "success": True,
+                "message": "One GSA listing was inserted into active_listings.",
+                "inserted_row": json_safe(inserted_row),
+            }
+        )
+
+    except Exception as error:
+        print("IMPORT ERROR:", repr(error), flush=True)
+
+        return jsonify(
+            {
+                "success": False,
+                "error": str(error),
+            }
+        ), 500
+
 
 @app.route("/count")
 def count_rows():
-
     try:
+        require_database_url()
 
         with psycopg.connect(DATABASE_URL) as conn:
-
             with conn.cursor() as cur:
-
-                cur.execute("""
-                    SELECT COUNT(*)
-                    FROM active_listings;
-                """)
+                cur.execute(
+                    "SELECT COUNT(*) FROM active_listings;"
+                )
 
                 count = cur.fetchone()[0]
 
-        return jsonify({
-
-            "success": True,
-
-            "table":
-                "active_listings",
-
-            "row_count":
-                count
-
-        })
+        return jsonify(
+            {
+                "success": True,
+                "table": TABLE_NAME,
+                "row_count": count,
+            }
+        )
 
     except Exception as error:
+        print("COUNT ERROR:", repr(error), flush=True)
 
-        return jsonify({
+        return jsonify(
+            {
+                "success": False,
+                "error": str(error),
+            }
+        ), 500
 
-            "success": False,
-
-            "error":
-                str(error)
-
-        }), 500
-
-
-# ============================================================
-# SHOW LAST 5 LISTINGS
-# ============================================================
-
-@app.route("/recent")
-def recent():
-
-    try:
-
-        with psycopg.connect(DATABASE_URL) as conn:
-
-            with conn.cursor() as cur:
-
-                cur.execute("""
-                    SELECT
-                        title,
-                        city,
-                        state,
-                        end_time
-                    FROM active_listings
-                    ORDER BY end_time DESC
-                    LIMIT 5;
-                """)
-
-                rows = cur.fetchall()
-
-        results = []
-
-        for row in rows:
-
-            results.append({
-
-                "title":
-                    row[0],
-
-                "city":
-                    row[1],
-
-                "state":
-                    row[2],
-
-                "end_time":
-                    str(row[3])
-                    if row[3] is not None
-                    else None
-
-            })
-
-        return jsonify({
-
-            "success": True,
-
-            "results":
-                results
-
-        })
-
-    except Exception as error:
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                str(error)
-
-        }), 500
-
-
-# ============================================================
-# LOCAL DEVELOPMENT
-# ============================================================
 
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
+    port = int(os.environ.get("PORT", 10000))
 
     app.run(
         host="0.0.0.0",
-        port=port
+        port=port,
     )
