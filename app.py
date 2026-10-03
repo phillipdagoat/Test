@@ -1,45 +1,41 @@
 import os
-import json
+from decimal import Decimal, InvalidOperation
+
 import requests
 import psycopg
-
 from flask import Flask, jsonify
 
 
 # ============================================================
-# FLASK
+# FLASK APP
 # ============================================================
 
 app = Flask(__name__)
 
 
 # ============================================================
-# SETTINGS
+# ENVIRONMENT VARIABLES
 # ============================================================
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-
-AUCTION_API_URL = (
-    "https://gateway.pipeworx.io/v1/tools/us_auctions_search"
-)
-
-
-# This will store the result of the startup import
-STARTUP_RESULT = {
-    "status": "starting"
-}
+GSA_API_KEY = os.environ.get("GSA_API_KEY")
 
 
 # ============================================================
-# DATABASE
+# GSA API
 # ============================================================
 
-def create_listings_table():
+GSA_URL = "https://api.gsa.gov/assets/gsaauctions/v2/auctions"
+
+
+# ============================================================
+# CREATE TABLE IF IT DOES NOT EXIST
+# ============================================================
+
+def create_table():
 
     if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL environment variable is missing."
-        )
+        raise RuntimeError("DATABASE_URL is missing.")
 
     with psycopg.connect(DATABASE_URL) as conn:
 
@@ -48,448 +44,206 @@ def create_listings_table():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS listings (
 
-                    id TEXT PRIMARY KEY,
+                    id BIGSERIAL PRIMARY KEY,
 
-                    listing_url TEXT,
-
-                    auction_house TEXT,
+                    start_time DATE,
+                    end_time DATE,
 
                     title TEXT,
 
+                    address TEXT,
+                    city TEXT,
+                    state TEXT,
+                    zip_code TEXT,
+
                     description TEXT,
 
-                    category TEXT,
+                    seller_name TEXT,
+                    seller_email TEXT,
+                    seller_phone TEXT,
 
-                    location TEXT,
+                    reserve NUMERIC(12, 2),
+                    bid_increment NUMERIC(12, 2),
 
-                    state TEXT,
-
-                    end_time TEXT
-
+                    photo_url TEXT
                 );
             """)
 
         conn.commit()
 
-    print("LISTINGS TABLE READY")
-
 
 # ============================================================
-# HELPER
+# FIND FIRST LISTING IN GSA RESPONSE
 # ============================================================
 
-def first_value(data, *keys):
+def find_first_listing(data):
 
-    if not isinstance(data, dict):
-        return None
+    # --------------------------------------------------------
+    # If response itself is a list
+    # --------------------------------------------------------
 
-    for key in keys:
+    if isinstance(data, list):
 
-        if key in data:
+        for item in data:
 
-            value = data[key]
+            if isinstance(item, dict):
 
-            if value is not None:
+                # Looks like a GSA listing
+                if "SaleNo" in item or "ItemName" in item:
+                    return item
 
-                if isinstance(value, dict):
+                found = find_first_listing(item)
 
-                    # Try common nested names first
-
-                    for nested_key in [
-                        "name",
-                        "title",
-                        "label",
-                        "value",
-                        "code"
-                    ]:
-
-                        if value.get(nested_key):
-                            return str(value[nested_key])
-
-                    return json.dumps(value)
-
-                if isinstance(value, list):
-                    return json.dumps(value)
-
-                return str(value)
-
-    return None
-
-
-# ============================================================
-# FIND LISTING INSIDE API RESPONSE
-# ============================================================
-
-def find_listing(obj):
-
-    if isinstance(obj, dict):
-
-        keys = set(obj.keys())
-
-        # ----------------------------------------------------
-        # Looks like an auction listing
-        # ----------------------------------------------------
-
-        has_title = (
-            "title" in keys
-            or "name" in keys
-        )
-
-        has_url = any(
-            key in keys
-            for key in [
-                "listing_url",
-                "url",
-                "link",
-                "lot_url",
-                "source_url"
-            ]
-        )
-
-        if has_title and has_url:
-            return obj
-
-        # ----------------------------------------------------
-        # Check common result containers first
-        # ----------------------------------------------------
-
-        for key in [
-            "results",
-            "listings",
-            "lots",
-            "items",
-            "data",
-            "result"
-        ]:
-
-            if key in obj:
-
-                found = find_listing(obj[key])
-
-                if found is not None:
+                if found:
                     return found
 
-        # ----------------------------------------------------
-        # Search everything recursively
-        # ----------------------------------------------------
+    # --------------------------------------------------------
+    # If response is a dictionary
+    # --------------------------------------------------------
 
-        for value in obj.values():
+    if isinstance(data, dict):
 
-            found = find_listing(value)
+        # This dictionary itself may be a listing
+        if "SaleNo" in data or "ItemName" in data:
+            return data
 
-            if found is not None:
-                return found
+        # Search nested dictionaries/lists
+        for value in data.values():
 
+            found = find_first_listing(value)
 
-    elif isinstance(obj, list):
-
-        for item in obj:
-
-            found = find_listing(item)
-
-            if found is not None:
+            if found:
                 return found
 
     return None
 
 
 # ============================================================
-# LOCATION
+# CONVERT NUMERIC VALUES
 # ============================================================
 
-def extract_location(raw_listing):
+def to_decimal(value):
 
-    location = raw_listing.get("location")
+    if value is None:
+        return None
 
-    if isinstance(location, str):
-        return location
+    if value == "":
+        return None
 
-    if isinstance(location, dict):
+    try:
 
-        # Try full formatted value first
+        # Remove dollar signs and commas if GSA returns them
+        cleaned = str(value).replace("$", "").replace(",", "").strip()
 
-        for key in [
-            "formatted",
-            "full",
-            "name",
-            "address"
-        ]:
+        return Decimal(cleaned)
 
-            if location.get(key):
-                return str(location[key])
+    except (InvalidOperation, ValueError):
 
-        # Build city/state if available
-
-        city = location.get("city")
-        state = location.get("state")
-
-        if isinstance(state, dict):
-
-            state = (
-                state.get("code")
-                or state.get("name")
-            )
-
-        pieces = []
-
-        if city:
-            pieces.append(str(city))
-
-        if state:
-            pieces.append(str(state))
-
-        if pieces:
-            return ", ".join(pieces)
-
-        return json.dumps(location)
-
-    return first_value(
-        raw_listing,
-        "city",
-        "location_name"
-    )
+        return None
 
 
 # ============================================================
-# STATE
+# PULL ONE ACTIVE GSA LISTING
 # ============================================================
 
-def extract_state(raw_listing):
+def get_one_listing():
 
-    # --------------------------------------------------------
-    # State directly on listing
-    # --------------------------------------------------------
+    if not GSA_API_KEY:
+        raise RuntimeError("GSA_API_KEY is missing.")
 
-    state = raw_listing.get("state")
-
-    if state:
-
-        if isinstance(state, dict):
-
-            return (
-                state.get("code")
-                or state.get("abbreviation")
-                or state.get("name")
-            )
-
-        return str(state)
-
-    # --------------------------------------------------------
-    # State nested inside location
-    # --------------------------------------------------------
-
-    location = raw_listing.get("location")
-
-    if isinstance(location, dict):
-
-        state = location.get("state")
-
-        if isinstance(state, dict):
-
-            return (
-                state.get("code")
-                or state.get("abbreviation")
-                or state.get("name")
-            )
-
-        if state:
-            return str(state)
-
-    return None
-
-
-# ============================================================
-# NORMALIZE LISTING
-# ============================================================
-
-def normalize_listing(raw_listing):
-
-    listing = {
-
-        # ----------------------------------------------------
-        # URL
-        # ----------------------------------------------------
-
-        "listing_url": first_value(
-            raw_listing,
-            "listing_url",
-            "url",
-            "link",
-            "lot_url",
-            "source_url"
-        ),
-
-        # ----------------------------------------------------
-        # AUCTION HOUSE
-        # ----------------------------------------------------
-
-        "auction_house": first_value(
-            raw_listing,
-            "auction_house",
-            "selling_house",
-            "auctioneer",
-            "seller",
-            "house",
-            "source"
-        ),
-
-        # ----------------------------------------------------
-        # TITLE
-        # ----------------------------------------------------
-
-        "title": first_value(
-            raw_listing,
-            "title",
-            "name"
-        ),
-
-        # ----------------------------------------------------
-        # ID
-        # ----------------------------------------------------
-
-        "id": first_value(
-            raw_listing,
-            "id",
-            "listing_id",
-            "lot_id",
-            "item_id"
-        ),
-
-        # ----------------------------------------------------
-        # DESCRIPTION
-        # ----------------------------------------------------
-
-        "description": first_value(
-            raw_listing,
-            "description",
-            "lot_description",
-            "details",
-            "summary"
-        ),
-
-        # ----------------------------------------------------
-        # CATEGORY
-        # ----------------------------------------------------
-
-        "category": first_value(
-            raw_listing,
-            "category",
-            "asset_type",
-            "type"
-        ),
-
-        # ----------------------------------------------------
-        # LOCATION
-        # ----------------------------------------------------
-
-        "location": extract_location(
-            raw_listing
-        ),
-
-        # ----------------------------------------------------
-        # STATE
-        # ----------------------------------------------------
-
-        "state": extract_state(
-            raw_listing
-        ),
-
-        # ----------------------------------------------------
-        # END TIME
-        # ----------------------------------------------------
-
-        "end_time": first_value(
-            raw_listing,
-            "end_time",
-            "close_time",
-            "closing_time",
-            "closes_at",
-            "ends_at",
-            "end_date"
-        )
-    }
-
-    return listing
-
-
-# ============================================================
-# GET ONE ACTIVE AUCTION
-# ============================================================
-
-def get_one_active_listing():
-
-    print("")
-    print("CALLING AUCTION API...")
-    print("")
-
-    response = requests.post(
-        AUCTION_API_URL,
-
-        json={
-            "limit": 1
+    response = requests.get(
+        GSA_URL,
+        params={
+            "api_key": GSA_API_KEY,
+            "format": "JSON"
         },
-
-        headers={
-            "Content-Type": "application/json"
-        },
-
-        timeout=30
-    )
-
-    print(
-        "AUCTION API STATUS:",
-        response.status_code
+        timeout=60
     )
 
     response.raise_for_status()
 
     data = response.json()
 
-    # --------------------------------------------------------
-    # PRINT RAW JSON
-    # --------------------------------------------------------
+    listing = find_first_listing(data)
 
-    print("")
-    print("======================================")
-    print("RAW AUCTION API RESPONSE")
-    print("======================================")
-
-    print(
-        json.dumps(
-            data,
-            indent=2
-        )
-    )
-
-    print(
-        "======================================"
-    )
-
-    # --------------------------------------------------------
-    # FIND FIRST LISTING
-    # --------------------------------------------------------
-
-    raw_listing = find_listing(data)
-
-    if raw_listing is None:
-
+    if listing is None:
         raise RuntimeError(
-            "The API responded, but no listing could be found."
+            "GSA API responded successfully, but no listing was found."
         )
 
-    listing = normalize_listing(
-        raw_listing
-    )
+    return listing
 
-    # --------------------------------------------------------
-    # ID IS REQUIRED FOR DATABASE PRIMARY KEY
-    # --------------------------------------------------------
 
-    if not listing["id"]:
+# ============================================================
+# MAP GSA VARIABLES TO YOUR VARIABLES
+# ============================================================
 
-        raise RuntimeError(
-            "Listing was found but API listing ID was missing."
-        )
+def map_listing(gsa):
+
+    listing = {
+
+        # AucStartDt → start_time
+        "start_time":
+            gsa.get("AucStartDt"),
+
+        # AucEndDt → end_time
+        "end_time":
+            gsa.get("AucEndDt"),
+
+        # ItemName → title
+        "title":
+            gsa.get("ItemName"),
+
+        # PropertyAddr3 → address
+        "address":
+            gsa.get("PropertyAddr3"),
+
+        # PropertyCity → city
+        "city":
+            gsa.get("PropertyCity"),
+
+        # PropertyState → state
+        "state":
+            gsa.get("PropertyState"),
+
+        # PropertyZip → zip_code
+        "zip_code":
+            str(gsa.get("PropertyZip"))
+            if gsa.get("PropertyZip") is not None
+            else None,
+
+        # LotDescript → description
+        "description":
+            gsa.get("LotDescript"),
+
+        # ContractOfficer → seller_name
+        "seller_name":
+            gsa.get("ContractOfficer"),
+
+        # COEmail → seller_email
+        "seller_email":
+            gsa.get("COEmail"),
+
+        # COPhone → seller_phone
+        "seller_phone":
+            gsa.get("COPhone"),
+
+        # Reserve → reserve
+        "reserve":
+            to_decimal(
+                gsa.get("Reserve")
+            ),
+
+        # AucIncrement → bid_increment
+        "bid_increment":
+            to_decimal(
+                gsa.get("AucIncrement")
+            ),
+
+        # ImageURL → photo_url
+        "photo_url":
+            gsa.get("ImageURL")
+    }
 
     return listing
 
@@ -501,92 +255,56 @@ def get_one_active_listing():
 def print_listing(listing):
 
     print("")
-    print("======================================")
-    print("NORMALIZED LISTING")
-    print("======================================")
-    print("")
+    print("=====================================")
+    print("GSA LISTING")
+    print("=====================================")
 
-    print(
-        "listing_url:",
-        listing["listing_url"]
-    )
+    for key, value in listing.items():
 
-    print(
-        "auction_house:",
-        listing["auction_house"]
-    )
+        print(
+            f"{key}: {value}"
+        )
 
-    print(
-        "title:",
-        listing["title"]
-    )
-
-    print(
-        "id:",
-        listing["id"]
-    )
-
-    print(
-        "description:",
-        listing["description"]
-    )
-
-    print(
-        "category:",
-        listing["category"]
-    )
-
-    print(
-        "location:",
-        listing["location"]
-    )
-
-    print(
-        "state:",
-        listing["state"]
-    )
-
-    print(
-        "end_time:",
-        listing["end_time"]
-    )
-
-    print("")
-    print(
-        "======================================"
-    )
+    print("=====================================")
     print("")
 
 
 # ============================================================
-# INSERT LISTING INTO NEON
+# INSERT NEW ROW INTO NEON
 # ============================================================
 
-def save_listing(listing):
+def insert_listing(listing):
 
-    print(
-        "CONNECTING TO NEON..."
-    )
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing.")
 
-    with psycopg.connect(
-        DATABASE_URL
-    ) as conn:
+    with psycopg.connect(DATABASE_URL) as conn:
 
         with conn.cursor() as cur:
 
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO listings (
 
-                    listing_url,
-                    auction_house,
+                    start_time,
+                    end_time,
+
                     title,
-                    id,
-                    description,
-                    category,
-                    location,
+
+                    address,
+                    city,
                     state,
-                    end_time
+                    zip_code,
+
+                    description,
+
+                    seller_name,
+                    seller_email,
+                    seller_phone,
+
+                    reserve,
+                    bid_increment,
+
+                    photo_url
 
                 )
 
@@ -594,100 +312,96 @@ def save_listing(listing):
 
                     %s,
                     %s,
+
+                    %s,
+
                     %s,
                     %s,
                     %s,
                     %s,
+
+                    %s,
+
                     %s,
                     %s,
+                    %s,
+
+                    %s,
+                    %s,
+
                     %s
 
                 )
 
-                ON CONFLICT (id)
+                RETURNING id;
+            """, (
 
-                DO UPDATE SET
+                listing["start_time"],
+                listing["end_time"],
 
-                    listing_url =
-                        EXCLUDED.listing_url,
+                listing["title"],
 
-                    auction_house =
-                        EXCLUDED.auction_house,
+                listing["address"],
+                listing["city"],
+                listing["state"],
+                listing["zip_code"],
 
-                    title =
-                        EXCLUDED.title,
+                listing["description"],
 
-                    description =
-                        EXCLUDED.description,
+                listing["seller_name"],
+                listing["seller_email"],
+                listing["seller_phone"],
 
-                    category =
-                        EXCLUDED.category,
+                listing["reserve"],
+                listing["bid_increment"],
 
-                    location =
-                        EXCLUDED.location,
+                listing["photo_url"]
 
-                    state =
-                        EXCLUDED.state,
+            ))
 
-                    end_time =
-                        EXCLUDED.end_time;
-                """,
-
-                (
-
-                    listing["listing_url"],
-
-                    listing["auction_house"],
-
-                    listing["title"],
-
-                    listing["id"],
-
-                    listing["description"],
-
-                    listing["category"],
-
-                    listing["location"],
-
-                    listing["state"],
-
-                    listing["end_time"]
-
-                )
-            )
+            new_id = cur.fetchone()[0]
 
         conn.commit()
 
-    print("")
-    print(
-        "SUCCESSFULLY SAVED LISTING TO NEON"
-    )
-    print("")
+    return new_id
 
 
 # ============================================================
-# IMPORT ONE LISTING
+# COMPLETE IMPORT
 # ============================================================
 
 def import_one_listing():
 
-    create_listings_table()
+    # Make sure database table exists
+    create_table()
 
-    listing = get_one_active_listing()
+    # Pull one active listing from GSA
+    raw_gsa_listing = get_one_listing()
 
+    # Convert GSA names into your database names
+    listing = map_listing(
+        raw_gsa_listing
+    )
+
+    # Print it in Render logs
     print_listing(
         listing
     )
 
-    save_listing(
+    # Insert new row into Neon
+    new_id = insert_listing(
         listing
     )
 
-    return listing
+    print(
+        f"SUCCESS: New Neon row created. ID = {new_id}"
+    )
+
+    return new_id, listing
 
 
 # ============================================================
-# FLASK HOME PAGE
+# HOME PAGE
 # ============================================================
 
 @app.route("/")
@@ -695,20 +409,19 @@ def home():
 
     return jsonify({
 
+        "status": "running",
+
         "message":
-            "Auction API + Neon application is running.",
+            "GSA Auctions importer is running.",
 
-        "startup_result":
-            STARTUP_RESULT,
-
-        "import_endpoint":
+        "import_one_listing":
             "/import-one"
 
     })
 
 
 # ============================================================
-# MANUALLY IMPORT ONE ACTIVE LISTING
+# IMPORT ONE LISTING
 # ============================================================
 
 @app.route("/import-one")
@@ -716,14 +429,14 @@ def import_one():
 
     try:
 
-        listing = import_one_listing()
+        new_id, listing = import_one_listing()
 
         return jsonify({
 
             "success": True,
 
-            "message":
-                "One active auction listing was saved to Neon.",
+            "database_id":
+                new_id,
 
             "listing":
                 listing
@@ -733,7 +446,7 @@ def import_one():
     except Exception as error:
 
         print(
-            "IMPORT ERROR:",
+            "ERROR:",
             str(error)
         )
 
@@ -748,54 +461,7 @@ def import_one():
 
 
 # ============================================================
-# STARTUP IMPORT
-# ============================================================
-
-try:
-
-    listing = import_one_listing()
-
-    STARTUP_RESULT = {
-
-        "success": True,
-
-        "message":
-            "One active listing was imported during startup.",
-
-        "listing":
-            listing
-
-    }
-
-except Exception as error:
-
-    print("")
-    print(
-        "STARTUP IMPORT FAILED:"
-    )
-
-    print(
-        str(error)
-    )
-
-    print("")
-
-    # IMPORTANT:
-    # We do not crash Flask if the auction API
-    # or database temporarily fails.
-
-    STARTUP_RESULT = {
-
-        "success": False,
-
-        "error":
-            str(error)
-
-    }
-
-
-# ============================================================
-# LOCAL DEVELOPMENT
+# LOCAL RUN
 # ============================================================
 
 if __name__ == "__main__":
