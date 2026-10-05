@@ -2,7 +2,7 @@ import os
 import psycopg
 
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("postgresql://neondb_owner:npg_MK3mWkS7VCUY@ep-billowing-bird-b4tf4grq-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
 
 
 def insert_active_listing(listing: dict):
